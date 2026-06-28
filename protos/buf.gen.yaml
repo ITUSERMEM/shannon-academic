@@ -1,5 +1,10 @@
 version: v1
 
+# Note: buf discovers all .proto files recursively under protos/,
+# so academic/academic.proto is automatically included by the plugins below.
+# No separate academic entry is needed — Go output goes to
+# ../go/orchestrator/internal/pb/academic/ automatically via source_relative.
+
 plugins:
   - plugin: buf.build/protocolbuffers/go
     out: ../go/orchestrator/internal/pb

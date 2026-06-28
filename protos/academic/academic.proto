@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package shannon.academic;
+option go_package = "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/academic";
+
+// AcademicService — Python backend activities called by Go Temporal workflow.
+// These are coarse-grained RPCs that map 1:1 to Temporal Activity definitions.
+// Each call encapsulates significant internal complexity rather than exposing
+// fine-grained operations, matching the design principle that agent iteration
+// internals stay in the Python process.
+service AcademicService {
+  // ExecutePhase runs one full phase (0-5) of the academic pipeline.
+  // Includes agent iteration loop, context compaction, watchdog checks,
+  // parallel skill execution, and hallucination guards within the Python side.
+  rpc ExecutePhase(ExecutePhaseRequest) returns (ExecutePhaseResponse);
+
+  // EvaluateGate checks whether a phase's review gate criteria are met.
+  // Called by the Go workflow after ExecutePhase returns, to decide
+  // whether to transition to the next phase, retry, or roll back.
+  rpc EvaluateGate(EvaluateGateRequest) returns (EvaluateGateResponse);
+
+  // RecordEvent persists a workflow lifecycle event for audit/observability.
+  // Events include phase transitions, gate verdicts, errors, and budget events.
+  rpc RecordEvent(RecordEventRequest) returns (RecordEventResponse);
+
+  // GetBudget returns the current budget state for a project.
+  // Read-only — Python never enforces, Go side does the enforcement.
+  rpc GetBudget(GetBudgetRequest) returns (GetBudgetResponse);
+
+  // HealthCheck verifies the Python backend process is alive and ready.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ── ExecutePhase ────────────────────────────────────────────
+
+message ExecutePhaseRequest {
+  string project_id = 1;
+  int32 phase = 2;               // 0-5
+  string title = 3;              // Research topic / project title
+  string context = 4;            // Serialized pipeline context JSON
+  int32 max_iterations = 5;      // Agent iterations per phase
+  repeated string force_agents = 6;  // Optional: override agent roster
+  string resume_session_id = 7;  // Optional: resume from checkpoint
+}
+
+message ExecutePhaseResponse {
+  string project_id = 1;
+  int32 phase = 2;
+  bool completed = 3;
+  string result_summary = 4;       // Human-readable phase outcome
+  repeated string completed_tasks = 5;
+  string error_message = 6;
+  string session_id = 7;           // Session ID for subsequent gate evaluation
+  string checkpoint_token = 8;     // Opaque token representing phase state
+  int32 iterations_run = 9;
+}
+
+// ── EvaluateGate ────────────────────────────────────────────
+
+message EvaluateGateRequest {
+  string project_id = 1;
+  int32 current_phase = 2;
+  string phase_result = 3;    // Serialized phase output (JSON)
+  string session_id = 4;      // Session context for gate evaluation
+}
+
+message EvaluateGateResponse {
+  bool passed = 1;
+  int32 next_phase = 2;       // -1 = fail/rollback, 0-5 = next phase
+  string reason = 3;
+  string verdict = 4;         // "pass", "revise", "fail"
+  repeated string issues = 5;
+}
+
+// ── RecordEvent ─────────────────────────────────────────────
+
+message RecordEventRequest {
+  string project_id = 1;
+  string event_type = 2;     // phase_start, phase_complete, gate_pass,
+                              // gate_fail, gate_retry, error, budget_exceeded
+  string payload = 3;         // Serialized event data JSON
+  string session_id = 4;
+}
+
+message RecordEventResponse {
+  bool recorded = 1;
+  string event_id = 2;
+}
+
+// ── GetBudget (read-only) ───────────────────────────────────
+
+message GetBudgetRequest {
+  string project_id = 1;
+}
+
+message GetBudgetResponse {
+  int32 tokens_used = 1;
+  int32 tokens_limit = 2;
+  double cost_usd = 3;
+  double budget_usd = 4;
+  double usage_pct = 5;      // 0.0 - 1.0
+  string action = 6;         // "ok", "degrade", "stop"
+}
+
+// ── HealthCheck ─────────────────────────────────────────────
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  int32 active_sessions = 3;
+  string status = 4;         // "ready", "busy", "degraded"
+}
