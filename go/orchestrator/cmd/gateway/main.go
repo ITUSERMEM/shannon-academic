@@ -38,6 +38,12 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
+
+	academicworkflow "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/workflows/academic"
+	academicactivities "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/activities/academic"
 )
 
 func main() {
@@ -207,6 +213,16 @@ func main() {
 		zap.Int("total_skills", skillRegistry.Count()),
 		zap.Strings("categories", skillRegistry.Categories()),
 	)
+
+	// Initialize academic gRPC client for Temporal activities
+	academicAddr := getEnvOrDefault("ACADEMIC_GRPC", "localhost:50053")
+	if err := academicactivities.InitAcademicClient(academicAddr); err != nil {
+		logger.Fatal("Failed to connect to academic service", zap.Error(err))
+	}
+	logger.Info("Academic gRPC client initialized", zap.String("addr", academicAddr))
+
+	// Start Temporal worker for academic pipeline workflows
+	startTemporalWorker(logger)
 
 	// Create session manager for persisting HITL messages to session history
 	sessionMgr, err := session.NewManager(redisOpts.Addr, logger)
@@ -1137,6 +1153,21 @@ func main() {
 		),
 	)
 
+	// Academic workflow endpoints
+	mux.Handle("POST /api/v1/workflow/start",
+		tracingMiddleware(
+			authMiddleware(
+				validationMiddleware(
+					http.HandlerFunc(handleStartAcademicWorkflow),
+				),
+			),
+		),
+	)
+
+	logger.Info("Registered academic workflow endpoint",
+		zap.String("endpoint", "POST /api/v1/workflow/start"),
+	)
+
 	logger.Info("Registered Shannon system endpoints",
 		zap.String("endpoints", "GET /api/v1/circuitbreaker/status, GET /api/v1/degradation/level, GET /api/v1/shannon/schedules"),
 	)
@@ -1184,6 +1215,76 @@ func main() {
 	}
 
 	logger.Info("Gateway stopped")
+}
+
+// startTemporalWorker creates and starts a Temporal worker for academic workflows.
+func startTemporalWorker(logger *zap.Logger) {
+	c, err := client.Dial(client.Options{})
+	if err != nil {
+		logger.Fatal("Unable to create Temporal client", zap.Error(err))
+	}
+
+	w := worker.New(c, "academic-task-queue", worker.Options{})
+	w.RegisterWorkflow(academicworkflow.AcademicWorkflow)
+	w.RegisterActivity(academicactivities.ExecutePhaseActivity)
+	w.RegisterActivity(academicactivities.EvaluateGateActivity)
+	w.RegisterActivity(academicactivities.RecordEventActivity)
+	w.RegisterActivity(academicactivities.GetBudgetActivity)
+
+	go func() {
+		if err := w.Run(worker.InterruptCh()); err != nil {
+			logger.Fatal("Unable to start Temporal worker", zap.Error(err))
+		}
+	}()
+	logger.Info("Temporal worker started", zap.String("task_queue", "academic-task-queue"))
+}
+
+// handleStartAcademicWorkflow starts an AcademicWorkflow via Temporal client.
+func handleStartAcademicWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ProjectID  string `json:"project_id"`
+		Title      string `json:"title"`
+		StartPhase int32  `json:"start_phase"`
+		EndPhase   int32  `json:"end_phase"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+	if req.ProjectID == "" {
+		http.Error(w, `{"error":"project_id is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	c, err := client.Dial(client.Options{})
+	if err != nil {
+		http.Error(w, `{"error":"failed to connect to Temporal"}`, http.StatusInternalServerError)
+		return
+	}
+	defer c.Close()
+
+	opts := client.StartWorkflowOptions{
+		ID:        "academic-" + req.ProjectID,
+		TaskQueue: "academic-task-queue",
+	}
+	we, err := c.ExecuteWorkflow(context.Background(), opts, academicworkflow.AcademicWorkflow, academicworkflow.AcademicWorkflowParams{
+		ProjectID:  req.ProjectID,
+		Title:      req.Title,
+		StartPhase: req.StartPhase,
+		EndPhase:   req.EndPhase,
+	})
+	if err != nil {
+		log.Printf("error: failed to start academic workflow: %v", err)
+		http.Error(w, `{"error":"failed to start workflow"}`, http.StatusInternalServerError)
+		return
+	}
+
+	resp := map[string]string{
+		"workflow_id": we.GetID(),
+		"run_id":      we.GetRunID(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // circuitBreakerOpenChecker adapts a bool func to the interface expected by degradation manager
