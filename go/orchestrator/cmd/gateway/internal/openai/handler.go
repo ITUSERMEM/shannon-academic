@@ -37,8 +37,9 @@ type Handler struct {
 	translator     *Translator
 	sessionManager *SessionManager
 	adminURL      string // URL for SSE streaming (e.g., "http://orchestrator:8081")
-	llmServiceURL string
-	attStore       *attachments.Store
+	llmServiceURL     string
+	academicBackendURL string
+	attStore           *attachments.Store
 }
 
 // NewHandler creates a new OpenAI API handler.
@@ -59,6 +60,11 @@ func NewHandler(
 		llmURL = "http://llm-service:8000"
 	}
 
+	academicURL := os.Getenv("ACADEMIC_BACKEND_URL")
+	if academicURL == "" {
+		academicURL = "http://localhost:8001"
+	}
+
 	return &Handler{
 		orchClient:     orchClient,
 		db:             db,
@@ -67,9 +73,10 @@ func NewHandler(
 		registry:       registry,
 		translator:     NewTranslator(registry),
 		sessionManager: NewSessionManager(redisClient, logger),
-		adminURL:      strings.TrimRight(adminURL, "/"),
-		llmServiceURL: strings.TrimRight(llmURL, "/"),
-		attStore:       attachments.NewStore(redisClient, 30*time.Minute),
+		adminURL:           strings.TrimRight(adminURL, "/"),
+		llmServiceURL:      strings.TrimRight(llmURL, "/"),
+		academicBackendURL: strings.TrimRight(academicURL, "/"),
+		attStore:           attachments.NewStore(redisClient, 30*time.Minute),
 	}, nil
 }
 
@@ -114,6 +121,13 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !h.registry.IsValidModel(modelName) {
 		metrics.RecordError(ErrorTypeInvalidRequest, ErrorCodeModelNotFound)
 		h.sendError(w, fmt.Sprintf("Model '%s' not found. Use GET /v1/models to list available models.", req.Model), ErrorTypeInvalidRequest, ErrorCodeModelNotFound, http.StatusNotFound)
+		return
+	}
+
+	// Academic model: route via HTTP reverse proxy to Python backend
+	modelConfig, _ := h.registry.GetModel(modelName)
+	if modelConfig != nil && modelConfig.WorkflowMode == "academic" {
+		h.handleAcademicChatCompletions(w, r, &req, modelName, metrics)
 		return
 	}
 
@@ -883,5 +897,111 @@ func streamContent(w io.Writer, content string) {
 	if flusher, ok := w.(http.Flusher); ok {
 		w.Write([]byte(content))
 		flusher.Flush()
+	}
+}
+
+// handleAcademicChatCompletions proxies chat completions to the academic
+// Python backend via HTTP, bypassing the orchestrator gRPC pipeline.
+func (h *Handler) handleAcademicChatCompletions(
+	w http.ResponseWriter,
+	r *http.Request,
+	req *ChatCompletionRequest,
+	modelName string,
+	metrics *MetricsRecorder,
+) {
+	ctx := r.Context()
+	body, err := json.Marshal(req)
+	if err != nil {
+		metrics.RecordError(ErrorTypeServer, ErrorCodeInternalError)
+		h.sendError(w, "Failed to re-encode request", ErrorTypeServer, ErrorCodeInternalError, http.StatusInternalServerError)
+		return
+	}
+	proxyURL := h.academicBackendURL + "/v1/chat/completions"
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, proxyURL, bytes.NewReader(body))
+	if err != nil {
+		metrics.RecordError(ErrorTypeServer, ErrorCodeInternalError)
+		h.sendError(w, "Failed to create proxy request", ErrorTypeServer, ErrorCodeInternalError, http.StatusInternalServerError)
+		return
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		proxyReq.Header.Set("Authorization", authHeader)
+	}
+	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
+		proxyReq.Header.Set("X-API-Key", apiKey)
+	}
+
+	var client *http.Client
+	if req.Stream {
+		client = &http.Client{}
+	} else {
+		client = &http.Client{Timeout: 120 * time.Second}
+	}
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		h.logger.Error("Academic backend proxy failed", zap.Error(err))
+		metrics.RecordError(ErrorTypeServer, ErrorCodeInternalError)
+		h.sendError(w, "Academic backend unavailable", ErrorTypeServer, ErrorCodeInternalError, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(resp.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(errBody)
+		return
+	}
+	if req.Stream {
+		h.handleAcademicStream(ctx, w, resp, modelName, metrics)
+		return
+	}
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.logger.Error("Failed to read academic response", zap.Error(err))
+		metrics.RecordError(ErrorTypeServer, ErrorCodeInternalError)
+		h.sendError(w, "Failed to read academic response", ErrorTypeServer, ErrorCodeInternalError, http.StatusBadGateway)
+		return
+	}
+	metrics.RecordSuccess()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
+// handleAcademicStream forwards SSE events from the academic Python backend.
+func (h *Handler) handleAcademicStream(
+	ctx context.Context,
+	w http.ResponseWriter,
+	resp *http.Response,
+	modelName string,
+	metrics *MetricsRecorder,
+) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		metrics.RecordError(ErrorTypeServer, ErrorCodeInternalError)
+		h.sendError(w, "Streaming not supported", ErrorTypeServer, ErrorCodeInternalError, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			metrics.RecordStreamError("client_disconnected")
+			return
+		default:
+		}
+		line := scanner.Text()
+		fmt.Fprintf(w, "%s\n", line)
+		flusher.Flush()
+	}
+	if err := scanner.Err(); err != nil {
+		h.logger.Error("Academic stream scanner error", zap.Error(err))
+		metrics.RecordStreamError("stream_interrupted")
 	}
 }

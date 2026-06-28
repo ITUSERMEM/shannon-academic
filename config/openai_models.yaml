@@ -77,6 +77,17 @@ models:
       requests_per_minute: 15
       tokens_per_minute: 100000
 
+  # Academic - Full academic research pipeline (Phase 0-5)
+  academic:
+    workflow_mode: academic
+    context:
+      academic_pipeline: true
+    description: "Academic research pipeline (Phase 0-5 full loop)"
+    max_tokens_default: 16384
+    rate_limit:
+      requests_per_minute: 5
+      tokens_per_minute: 50000
+
 # Default model when none specified
 default_model: shannon-chat
 
