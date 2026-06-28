@@ -1,0 +1,21 @@
+[Unit]
+Description=Academic Go Gateway
+Documentation=https://github.com/ITUSERMEM/shannon-academic
+After=network.target academic-python.service redis-stack.service temporal.service
+Requires=academic-python.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/tmp
+ExecStart=/tmp/gateway
+Restart=on-failure
+RestartSec=5
+Environment=POSTGRES_HOST=localhost
+Environment=REDIS_URL=redis://localhost:6379
+Environment=ACADEMIC_GRPC=localhost:8002
+Environment=GATEWAY_SKIP_AUTH=1
+Environment=ENVIRONMENT=dev
+
+[Install]
+WantedBy=multi-user.target

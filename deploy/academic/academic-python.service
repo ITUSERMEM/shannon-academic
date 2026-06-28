@@ -1,0 +1,20 @@
+[Unit]
+Description=Academic Python gRPC+HTTP Service
+Documentation=https://github.com/ITUSERMEM/shannon-academic
+After=network.target redis-stack.service
+Requires=redis-stack.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/.config/opencode/redis-memory
+ExecStart=/root/anaconda3/bin/python academic_grpc_server.py
+Restart=on-failure
+RestartSec=10
+Environment=ACADEMIC_GRPC_PORT=8002
+Environment=ZEN_API_KEY=test
+Environment=ARK_API_KEY=test
+Environment=DEEPSEEK_API_KEY=test
+
+[Install]
+WantedBy=multi-user.target

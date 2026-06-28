@@ -1,0 +1,8 @@
+[Unit]
+Description=Academic Pipeline Service Group
+Documentation=https://github.com/ITUSERMEM/shannon-academic
+Requires=academic-python.service academic-gateway.service
+Wants=redis-stack.service temporal.service
+
+[Install]
+WantedBy=multi-user.target
