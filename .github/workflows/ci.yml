@@ -1,0 +1,81 @@
+name: shannon-academic CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  go-lint-build:
+    name: Go lint + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - run: cd go/orchestrator && go vet ./...
+      - run: cd go/orchestrator && go build ./...
+
+  rust-lint-build:
+    name: Rust lint + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cd rust/agent-core && cargo build --release
+      - run: cd rust/agent-core && cargo clippy -- -D warnings
+
+  python-test:
+    name: Python test + budget gate
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis/redis-stack:latest
+        ports: [6379:6379]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install fastapi uvicorn pydantic grpcio grpcio-tools pytest
+      - run: ZEN_API_KEY=test ARK_API_KEY=test DEEPSEEK_API_KEY=test pytest tests/ -v --tb=short -k "not slow"
+      - run: bash scripts/check_budget_write.sh
+
+  integration:
+    name: Integration E2E
+    needs: [go-lint-build, rust-lint-build, python-test]
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis/redis-stack:latest
+        ports: [6379:6379]
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: temporal
+          POSTGRES_PASSWORD: temporal
+          POSTGRES_DB: temporal
+        ports: [5432:5432]
+      temporal:
+        image: temporalio/auto-setup:1.26
+        env:
+          DB: postgresql
+          DB_PORT: 5432
+          POSTGRES_USER: temporal
+          POSTGRES_PASSWORD: temporal
+          POSTGRES_SEEDS: postgres
+        ports: [7233:7233]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install fastapi uvicorn pydantic grpcio grpcio-tools pytest
+      - run: cd go/orchestrator && go build -o /tmp/gateway ./cmd/gateway/
+      - run: python3 academic_grpc_server.py &
+      - run: ZEN_API_KEY=test ARK_API_KEY=test DEEPSEEK_API_KEY=test GATEWAY_SKIP_AUTH=1 ENVIRONMENT=dev ACADEMIC_GRPC="localhost:8002" /tmp/gateway &
+      - run: sleep 5
+      - run: curl -s -X POST http://localhost:8080/api/v1/workflow/start -H "Content-Type: application/json" -d '{"project_id":"ci-test","title":"CI E2E","start_phase":0,"end_phase":0}'
+      - run: sleep 10
+      - run: curl -s http://localhost:8080/v1/health
