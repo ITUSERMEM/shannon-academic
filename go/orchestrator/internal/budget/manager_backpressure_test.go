@@ -404,23 +404,20 @@ func TestBudgetAllocationStrategies(t *testing.T) {
 // Helper function to create test schema
 func createTestSchema(t *testing.T, db *sql.DB) {
 	schema := `
-	CREATE TABLE IF NOT EXISTS token_usage (
-	    id INTEGER PRIMARY KEY AUTOINCREMENT,
-	    user_id TEXT NOT NULL,
-	    task_id TEXT,
-	    session_id TEXT,
-	    agent_id TEXT,
-	    provider TEXT,
-	    model TEXT,
-	    prompt_tokens INTEGER DEFAULT 0,
-	    completion_tokens INTEGER DEFAULT 0,
-	    total_tokens INTEGER DEFAULT 0,
-	    cost_usd REAL DEFAULT 0,
-	    cache_read_tokens INTEGER DEFAULT 0,
-	    cache_creation_tokens INTEGER DEFAULT 0,
-	    call_sequence INTEGER DEFAULT 0,
-	    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
+	    CREATE TABLE IF NOT EXISTS token_usage (
+	        id INTEGER PRIMARY KEY AUTOINCREMENT,
+	        user_id TEXT NOT NULL,
+	        task_id TEXT,
+	        session_id TEXT,
+	        agent_id TEXT,
+	        provider TEXT,
+	        model TEXT,
+	        prompt_tokens INTEGER DEFAULT 0,
+	        completion_tokens INTEGER DEFAULT 0,
+	        total_tokens INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     
     CREATE TABLE IF NOT EXISTS budget_policies (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

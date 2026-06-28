@@ -6,7 +6,6 @@ use tracing::info;
 
 use shannon_agent_core::grpc_server::proto::agent::agent_service_server::AgentServiceServer;
 use shannon_agent_core::grpc_server::AgentServiceImpl;
-use shannon_agent_core::sandbox_service::SandboxServiceImpl;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,8 +30,6 @@ async fn main() -> Result<()> {
 
     let addr = "0.0.0.0:50051".parse()?;
     let agent_service = AgentServiceImpl::new()?;
-    let sandbox_service = SandboxServiceImpl::from_env();
-    info!("SandboxService initialized from environment");
 
     // Build reflection service
     let reflection_service = tonic_reflection::server::Builder::configure()
@@ -46,7 +43,6 @@ async fn main() -> Result<()> {
 
     Server::builder()
         .add_service(AgentServiceServer::new(agent_service))
-        .add_service(sandbox_service.into_service())
         .add_service(reflection_service)
         .serve(addr)
         .await?;

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -16,14 +17,19 @@ import (
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/cmd/gateway/internal/middleware"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/cmd/gateway/internal/openai"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/cmd/gateway/internal/proxy"
-	authpkg "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/auth"
+	authpkg 	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/auth"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/budget"
 	cfg "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/config"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pricing"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/daemon"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/db"
+	agentpb "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/agent"
 	orchpb "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/orchestrator"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/session"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/skills"
 	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/streaming"
+	circuitbreaker "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/circuitbreaker"
+	degradationpkg "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/degradation"
 	redisv8 "github.com/go-redis/redis/v8"
 	"github.com/jmoiron/sqlx"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -31,6 +37,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func main() {
@@ -80,6 +87,10 @@ func main() {
 	// Create sqlx.DB wrapper for auth service
 	pgDB := sqlx.NewDb(dbClient.GetDB(), "postgres")
 
+	// Initialize budget manager for token/cost budgeting
+	budgetManager := budget.NewBudgetManager(dbClient.GetDB(), logger)
+	_ = budgetManager // used by /api/v1/budget/check
+
 	// Initialize Redis client for rate limiting and idempotency
 	redisURL := getEnvOrDefault("REDIS_URL", "redis://redis:6379")
 	redisOpts, err := redis.ParseURL(redisURL)
@@ -94,6 +105,43 @@ func main() {
 	if _, err := redisClient.Ping(ctx).Result(); err != nil {
 		logger.Fatal("Failed to connect to Redis", zap.Error(err))
 	}
+
+	// Initialize circuit breakers for Redis and database
+	redisCBCfg := circuitbreaker.GetRedisConfig().ToConfig()
+	redisCBCfg.OnStateChange = func(name string, from, to circuitbreaker.State) {
+		logger.Info("Redis circuit breaker state changed",
+			zap.String("from", from.String()),
+			zap.String("to", to.String()),
+		)
+	}
+	redisCB := circuitbreaker.NewCircuitBreaker("redis", redisCBCfg, logger)
+	circuitbreaker.GlobalMetricsCollector.RegisterCircuitBreaker("redis", "gateway", redisCB)
+
+	dbCBCfg := circuitbreaker.GetDatabaseConfig().ToConfig()
+	dbCBCfg.OnStateChange = func(name string, from, to circuitbreaker.State) {
+		logger.Info("Database circuit breaker state changed",
+			zap.String("from", from.String()),
+			zap.String("to", to.String()),
+		)
+	}
+	dbCB := circuitbreaker.NewCircuitBreaker("postgresql", dbCBCfg, logger)
+	circuitbreaker.GlobalMetricsCollector.RegisterCircuitBreaker("postgresql", "gateway", dbCB)
+
+	// Create circuit breaker status handler for Python HTTP bridge
+	cbStatusHandler := handlers.NewCircuitBreakerStatusHandler(logger)
+	cbStatusHandler.Register("redis", redisCB)
+	cbStatusHandler.Register("postgresql", dbCB)
+
+	// Initialize degradation manager
+	degradationMgr := degradationpkg.NewManager(
+		circuitBreakerOpenChecker(func() bool { return redisCB.State() == circuitbreaker.StateOpen }),
+		circuitBreakerOpenChecker(func() bool { return dbCB.State() == circuitbreaker.StateOpen }),
+		logger,
+	)
+	if err := degradationMgr.Start(ctx); err != nil {
+		logger.Warn("Failed to start degradation manager", zap.Error(err))
+	}
+	degradationLevelHandler := handlers.NewDegradationLevelHandler(degradationMgr, logger)
 
 	// Initialize streaming manager with Redis so gateway can subscribe to
 	// workflow events for streaming card replies.
@@ -122,6 +170,28 @@ func main() {
 	defer conn.Close()
 
 	orchClient := orchpb.NewOrchestratorServiceClient(conn)
+
+	// Connect to Rust agent-core gRPC
+	rustAgentAddr := getEnvOrDefault("RUST_AGENT_GRPC", "localhost:50051")
+	rustAgentConn, err := grpc.Dial(rustAgentAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50*1024*1024)),
+	)
+	if err != nil {
+		logger.Fatal("Failed to connect to Rust agent-core", zap.Error(err))
+	}
+	defer rustAgentConn.Close()
+	rustAgentClient := agentpb.NewAgentServiceClient(rustAgentConn)
+
+	// Verify Rust agent connection with health check
+	if healthResp, err := rustAgentClient.HealthCheck(ctx, &agentpb.HealthCheckRequest{}); err != nil {
+		logger.Warn("Rust agent-core health check failed (service may be starting)", zap.Error(err))
+	} else {
+		logger.Info("Rust agent-core connected",
+			zap.Bool("healthy", healthResp.GetHealthy()),
+			zap.String("addr", rustAgentAddr),
+		)
+	}
 
 	// Initialize skill registry
 	skillRegistry := skills.NewRegistry()
@@ -765,8 +835,58 @@ func main() {
 		),
 	)
 
+	// Rust agent ExecuteTask endpoint: POST /api/v1/tools/execute
+	mux.Handle("POST /api/v1/tools/execute",
+		tracingMiddleware(
+			authMiddleware(
+				validationMiddleware(
+					rateLimiter(
+						http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							var req struct {
+								ToolName string                 `json:"tool_name"`
+								Input    map[string]interface{} `json:"input"`
+							}
+							if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+								http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+								return
+							}
+							if req.ToolName == "" {
+								http.Error(w, `{"error":"tool_name is required"}`, http.StatusBadRequest)
+								return
+							}
+
+							inputStruct, err := structpb.NewStruct(req.Input)
+							if err != nil {
+								http.Error(w, `{"error":"invalid input"}`, http.StatusBadRequest)
+								return
+							}
+
+							grpcResp, err := rustAgentClient.ExecuteTask(r.Context(), &agentpb.ExecuteTaskRequest{
+								Query:   req.ToolName,
+								Context: inputStruct,
+							})
+							if err != nil {
+								logger.Error("Rust agent ExecuteTask failed", zap.Error(err))
+								http.Error(w, `{"error":"task execution failed"}`, http.StatusInternalServerError)
+								return
+							}
+
+							resp := map[string]interface{}{
+								"task_id": grpcResp.GetTaskId(),
+								"result":  grpcResp.GetResult(),
+								"status":  grpcResp.GetStatus().String(),
+							}
+							w.Header().Set("Content-Type", "application/json")
+							json.NewEncoder(w).Encode(resp)
+						}),
+					),
+				),
+			),
+		),
+	)
+
 	logger.Info("Registered tool execution API endpoints",
-		zap.String("endpoints", "/api/v1/tools, /api/v1/tools/{name}, /api/v1/tools/{name}/execute"),
+		zap.String("endpoints", "/api/v1/tools, /api/v1/tools/{name}, /api/v1/tools/{name}/execute, /api/v1/tools/execute"),
 	)
 
 	// OpenAI-compatible API endpoints (/v1/*)
@@ -937,6 +1057,90 @@ func main() {
 		),
 	)
 
+	// Budget check endpoint (requires auth)
+	mux.Handle("POST /api/v1/budget/check",
+		tracingMiddleware(
+			authMiddleware(
+				http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var req struct {
+						UserID        string  `json:"user_id"`
+						Model         string  `json:"model"`
+						EstimatedCost float64 `json:"estimated_cost"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+						http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+						return
+					}
+					if req.UserID == "" {
+						http.Error(w, `{"error":"user_id is required"}`, http.StatusBadRequest)
+						return
+					}
+					perToken := pricing.DefaultPerToken()
+					if p, ok := pricing.PricePerTokenForModel(req.Model); ok {
+						perToken = p
+					}
+					estimatedTokens := 0
+					if perToken > 0 {
+						estimatedTokens = int(req.EstimatedCost / perToken)
+					}
+					if estimatedTokens < 1 && req.EstimatedCost > 0 {
+						estimatedTokens = 1
+					}
+
+					result, err := budgetManager.CheckBudget(r.Context(), req.UserID, "", "", estimatedTokens)
+					if err != nil {
+						logger.Error("budget check failed", zap.Error(err))
+						http.Error(w, `{"error":"budget check failed"}`, http.StatusInternalServerError)
+						return
+					}
+
+					remainingBudget := float64(result.RemainingSessionBudget) * perToken
+
+					resp := map[string]interface{}{
+						"allowed":          result.CanProceed,
+						"remaining_budget": remainingBudget,
+					}
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(resp)
+				}),
+			),
+		),
+	)
+
+	logger.Info("Registered budget check endpoint",
+		zap.String("endpoint", "POST /api/v1/budget/check"),
+	)
+
+	// Circuit breaker status endpoint (Python bridge, no auth)
+	mux.Handle("GET /api/v1/circuitbreaker/status",
+		tracingMiddleware(
+			http.HandlerFunc(cbStatusHandler.ServeHTTP),
+		),
+	)
+
+	// Degradation level endpoint (Python bridge, no auth)
+	mux.Handle("GET /api/v1/degradation/level",
+		tracingMiddleware(
+			http.HandlerFunc(degradationLevelHandler.ServeHTTP),
+		),
+	)
+
+	// Schedules list endpoint (already exists via scheduleHandler.ListSchedules at line ~590)
+	// Python bridge: standalone /api/v1/shannon/schedules returns schedule info
+	mux.Handle("GET /api/v1/shannon/schedules",
+		tracingMiddleware(
+			authMiddleware(
+				validationMiddleware(
+					http.HandlerFunc(scheduleHandler.ListSchedules),
+				),
+			),
+		),
+	)
+
+	logger.Info("Registered Shannon system endpoints",
+		zap.String("endpoints", "GET /api/v1/circuitbreaker/status, GET /api/v1/degradation/level, GET /api/v1/shannon/schedules"),
+	)
+
 	// CORS middleware for all routes (development friendly)
 	corsHandler := corsMiddleware(mux)
 
@@ -981,6 +1185,11 @@ func main() {
 
 	logger.Info("Gateway stopped")
 }
+
+// circuitBreakerOpenChecker adapts a bool func to the interface expected by degradation manager
+type circuitBreakerOpenChecker func() bool
+
+func (f circuitBreakerOpenChecker) IsCircuitBreakerOpen() bool { return f() }
 
 // corsMiddleware adds CORS headers for development
 func corsMiddleware(next http.Handler) http.Handler {
