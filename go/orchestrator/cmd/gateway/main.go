@@ -1172,6 +1172,14 @@ func main() {
 		zap.String("endpoints", "GET /api/v1/circuitbreaker/status, GET /api/v1/degradation/level, GET /api/v1/shannon/schedules"),
 	)
 
+	// Swagger UI (no auth required)
+	mux.HandleFunc("GET /docs", handlers.DocsHandler)
+	mux.HandleFunc("GET /api/openapi.yaml", handlers.SpecHandler)
+
+	logger.Info("Registered docs endpoints",
+		zap.String("endpoints", "GET /docs, GET /api/openapi.yaml"),
+	)
+
 	// CORS middleware for all routes (development friendly)
 	corsHandler := corsMiddleware(mux)
 

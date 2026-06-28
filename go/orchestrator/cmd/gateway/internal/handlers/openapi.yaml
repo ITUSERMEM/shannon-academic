@@ -1,0 +1,260 @@
+openapi: "3.0.0"
+info:
+  title: shannon-academic API
+  description: >
+    Go Gateway for the shannon-academic research pipeline.
+    Routes OpenAI-compatible requests, manages budgets, orchestrates
+    Temporal workflows, and provides governance (circuit breaker,
+    degradation, rate limiting).
+  version: "0.2.0"
+  contact:
+    name: ITUSERMEM
+    url: https://github.com/ITUSERMEM/shannon-academic
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: http://gateway:8080
+    description: Docker internal
+
+paths:
+  /v1/health:
+    get:
+      summary: Health check
+      operationId: healthCheck
+      tags: [System]
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: healthy}
+                  sessions: {type: integer, example: 0}
+
+  /v1/models:
+    get:
+      summary: List available models
+      operationId: listModels
+      tags: [Models]
+      responses:
+        '200':
+          description: Model list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: {type: string, example: list}
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        object: {type: string, example: model}
+                        owned_by: {type: string, example: shannon}
+
+  /v1/chat/completions:
+    post:
+      summary: OpenAI-compatible chat completions
+      operationId: chatCompletions
+      tags: [OpenAI]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                model: {type: string, default: academic, example: academic}
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role: {type: string, enum: [system, user, assistant]}
+                      content: {type: string}
+                stream: {type: boolean, default: false}
+      responses:
+        '200':
+          description: Chat completion response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, example: chatcmpl-xxx}
+                  object: {type: string, example: chat.completion}
+                  created: {type: integer}
+                  model: {type: string}
+                  choices:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: {type: integer}
+                        message:
+                          type: object
+                          properties:
+                            role: {type: string}
+                            content: {type: string}
+                        finish_reason: {type: string}
+
+  /v1/completions:
+    post:
+      summary: Text completion (passthrough proxy)
+      operationId: completions
+      tags: [OpenAI]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                model: {type: string}
+                prompt: {type: string}
+      responses:
+        '200':
+          description: Completion response
+
+  /api/v1/budget/check:
+    post:
+      summary: Check budget availability
+      operationId: checkBudget
+      tags: [Budget]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id: {type: string}
+                model: {type: string}
+                estimated_cost: {type: number, format: float}
+      responses:
+        '200':
+          description: Budget check result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  allowed: {type: boolean}
+                  remaining_budget: {type: number}
+
+  /api/v1/workflow/start:
+    post:
+      summary: Start a Temporal academic workflow
+      operationId: startWorkflow
+      tags: [Workflow]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                project_id: {type: string}
+                title: {type: string, example: "TAFN Fault Diagnosis"}
+                start_phase: {type: integer, minimum: 0, maximum: 5, default: 0}
+                end_phase: {type: integer, minimum: 0, maximum: 5, default: 5}
+      responses:
+        '200':
+          description: Workflow started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: {type: string}
+                  workflow_id: {type: string}
+
+  /api/v1/tools/execute:
+    post:
+      summary: Execute a tool via Rust gRPC
+      operationId: executeTool
+      tags: [Tools]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tool_name: {type: string, example: echo}
+                input: {type: object}
+      responses:
+        '200':
+          description: Tool execution result
+
+  /api/v1/circuitbreaker/status:
+    get:
+      summary: Get circuit breaker status for all keys
+      operationId: circuitBreakerStatus
+      tags: [Governance]
+      responses:
+        '200':
+          description: Circuit breaker status per key
+
+  /api/v1/degradation/level:
+    get:
+      summary: Get current system degradation level
+      operationId: degradationLevel
+      tags: [Governance]
+      responses:
+        '200':
+          description: Degradation level
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  level: {type: integer, example: 0}
+                  overall: {type: string, example: none}
+                  status: {type: string, example: normal}
+
+  /api/v1/shannon/schedules:
+    get:
+      summary: List scheduled tasks
+      operationId: listSchedules
+      tags: [Schedules]
+      responses:
+        '200':
+          description: Schedule list
+
+  /api/v1/agents:
+    get:
+      summary: List registered agents
+      operationId: listAgents
+      tags: [Agents]
+      responses:
+        '200':
+          description: Agent list
+
+  /api/v1/skills:
+    get:
+      summary: List registered skills
+      operationId: listSkills
+      tags: [Skills]
+      responses:
+        '200':
+          description: Skill list
+
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: {type: string}
+            type: {type: string}
+            code: {type: string}

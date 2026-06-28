@@ -1,0 +1,27 @@
+# Stage 1: Build
+FROM golang:1.24 AS builder
+WORKDIR /build
+
+# Proto files needed for code generation
+COPY protos/ ./protos/
+COPY go/orchestrator/ ./go/orchestrator/
+COPY config/ ./config/
+
+# Build Gateway binary
+WORKDIR /build/go/orchestrator
+RUN go build -o /gateway ./cmd/gateway/
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /gateway /usr/local/bin/gateway
+COPY --from=builder /build/config /app/config
+
+WORKDIR /app
+EXPOSE 8080
+
+ENV GATEWAY_SKIP_AUTH=1
+ENV ENVIRONMENT=dev
+
+CMD ["gateway"]

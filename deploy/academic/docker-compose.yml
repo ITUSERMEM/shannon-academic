@@ -1,0 +1,92 @@
+version: "3.8"
+
+networks:
+  academic-net:
+    driver: bridge
+
+services:
+  # ── Infrastructure ──────────────────────────────
+  redis-stack:
+    image: redis/redis-stack:latest
+    container_name: academic-redis
+    ports: ["6379:6379"]
+    networks: [academic-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: academic-postgres
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    networks: [academic-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 5s
+      retries: 5
+
+  # ── Temporal ────────────────────────────────────
+  temporal:
+    image: temporalio/auto-setup:1.26
+    container_name: academic-temporal
+    ports: ["7233:7233"]
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_SEEDS: postgres
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [academic-net]
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: academic-temporal-ui
+    ports: ["8088:8080"]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    depends_on:
+      - temporal
+    networks: [academic-net]
+
+  # ── Python Academic Service ─────────────────────
+  python:
+    build:
+      context: ../..
+      dockerfile: deploy/academic/Dockerfile.python
+    container_name: academic-python
+    ports: ["8001:8001", "8002:8002"]
+    depends_on:
+      redis-stack: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    networks: [academic-net]
+
+  # ── Go Gateway ──────────────────────────────────
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/academic/Dockerfile.gateway
+    container_name: academic-gateway
+    ports: ["8080:8080"]
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: "redis://redis-stack:6379"
+      ACADEMIC_GRPC: "python:8002"
+      ACADEMIC_BACKEND_URL: "http://python:8001"
+      GATEWAY_SKIP_AUTH: "1"
+      ENVIRONMENT: "dev"
+      TEMPORAL_ADDRESS: "temporal:7233"
+    depends_on:
+      redis-stack: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      temporal: { condition: service_started }
+      python: { condition: service_started }
+    networks: [academic-net]
+    # Gateway binary needs config files from context
+    working_dir: /app
