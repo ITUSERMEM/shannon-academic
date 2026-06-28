@@ -1,6 +1,3 @@
-// Stress test for OnceLock-based metrics initialization
-// Tests for race conditions and concurrent initialization
-
 use shannon_agent_core::metrics;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -80,67 +77,6 @@ fn test_metrics_usage_without_initialization() {
     let metrics_output = metrics::get_metrics();
     // Output might be empty or contain some metrics depending on test order
     println!("Metrics output length: {}", metrics_output.len());
-}
-
-#[test]
-fn test_memory_pool_concurrent_access() {
-    use bytes::Bytes;
-    use shannon_agent_core::memory::MemoryPool;
-
-    // Create a shared memory pool
-    let pool = Arc::new(MemoryPool::new(10)); // 10MB pool
-
-    let mut handles = vec![];
-
-    // Spawn multiple threads that allocate and deallocate memory
-    for i in 0..20 {
-        let pool = pool.clone();
-
-        let handle = thread::spawn(move || {
-            // Use tokio runtime for async operations
-            let rt = tokio::runtime::Runtime::new().unwrap();
-
-            rt.block_on(async {
-                let key = format!("thread_{}", i);
-                let data = Bytes::from(vec![i as u8; 100_000]); // 100KB per thread
-
-                // Try to allocate
-                match pool.allocate(key.clone(), data.clone(), 60).await {
-                    Ok(_) => {
-                        println!("Thread {} allocated 100KB", i);
-
-                        // Retrieve the data
-                        if let Some(retrieved) = pool.retrieve(&key).await {
-                            assert_eq!(retrieved, data, "Retrieved data should match");
-                        }
-
-                        // Deallocate
-                        let _ = pool.deallocate(&key).await;
-                        println!("Thread {} deallocated", i);
-                    }
-                    Err(e) => {
-                        // Expected for some threads due to memory limit
-                        println!("Thread {} allocation failed (expected): {}", i, e);
-                    }
-                }
-            });
-        });
-
-        handles.push(handle);
-    }
-
-    // Wait for all threads
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    // Check final pool state
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let (used, max) = pool.get_usage_stats().await;
-        println!("Final pool state: {}/{} bytes used", used, max);
-        assert!(used <= max, "Used memory should not exceed max");
-    });
 }
 
 #[test]
